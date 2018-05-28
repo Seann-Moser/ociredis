@@ -8,8 +8,12 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/internal"
+	"github.com/go-redis/redis/internal/observability"
 	"github.com/go-redis/redis/internal/pool"
 	"github.com/go-redis/redis/internal/proto"
+
+	"go.opencensus.io/stats"
+	"go.opencensus.io/trace"
 )
 
 // Nil reply Redis returns when key does not exist.
@@ -32,6 +36,19 @@ type baseClient struct {
 	processTxPipeline func([]Cmder) error
 
 	onClose func() error // hook called when client is closed
+
+	ctxFunc func() context.Context // Optional function invoked
+}
+
+func (c *baseClient) context() context.Context {
+	var ctx context.Context
+	if c.ctxFunc != nil {
+		ctx = c.ctxFunc()
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return ctx
 }
 
 func (c *baseClient) init() {
@@ -60,29 +77,41 @@ func (c *baseClient) newConn() (*pool.Conn, error) {
 	return cn, nil
 }
 
-func (c *baseClient) getConn() (*pool.Conn, bool, error) {
+func (c *baseClient) getConn(ctx context.Context) (*pool.Conn, bool, error) {
+	_, span := trace.StartSpan(ctx, "redis.(*baseClient).getConn")
+	defer span.End()
+
 	cn, isNew, err := c.connPool.Get()
 	if err != nil {
+		span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
 		return nil, false, err
 	}
 
 	if !cn.Inited {
+		span.Annotatef(nil, "Initializing connection")
 		if err := c.initConn(cn); err != nil {
+			span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
 			_ = c.connPool.Remove(cn)
 			return nil, false, err
 		}
 	}
 
+	if isNew {
+		stats.Record(ctx, observability.MConnectionsNew.M(1), observability.MConnectionsTaken.M(1))
+	} else {
+		stats.Record(ctx, observability.MConnectionsReused.M(1), observability.MConnectionsTaken.M(1))
+	}
 	return cn, isNew, nil
 }
 
-func (c *baseClient) releaseConn(cn *pool.Conn, err error) bool {
+func (c *baseClient) releaseConn(ctx context.Context, cn *pool.Conn, err error) bool {
 	if internal.IsBadConn(err, false) {
 		_ = c.connPool.Remove(cn)
 		return false
 	}
 
 	_ = c.connPool.Put(cn)
+	stats.Record(ctx, observability.MConnectionsReturned.M(1))
 	return true
 }
 
@@ -132,41 +161,99 @@ func (c *baseClient) Process(cmd Cmder) error {
 }
 
 func (c *baseClient) defaultProcess(cmd Cmder) error {
+	ctx, span := trace.StartSpan(c.context(), "redis.(*baseClient)."+cmd.Name())
+	ctx, _ = observability.TagKeyValuesIntoContext(ctx, observability.KeyCommandName, cmd.Name())
+
+	startTime := time.Now()
+	defer func() {
+		span.End()
+		// Finally record the roundtrip latency.
+		stats.Record(ctx, observability.MRoundtripLatency.M(time.Since(startTime).Seconds()))
+	}()
+
 	for attempt := 0; attempt <= c.opt.MaxRetries; attempt++ {
+		span.Annotatef([]trace.Attribute{
+			trace.Int64Attribute("attempt", int64(attempt)),
+			trace.Int64Attribute("write_timeout_ns", c.opt.WriteTimeout.Nanoseconds()),
+		}, "Getting connection")
+
 		if attempt > 0 {
-			time.Sleep(c.retryBackoff(attempt))
+			td := c.retryBackoff(attempt)
+			span.Annotatef([]trace.Attribute{
+				trace.StringAttribute("sleep_duration", td.String()),
+				trace.Int64Attribute("attempt", int64(attempt)),
+			}, "Sleeping for exponential backoff")
+			time.Sleep(td)
 		}
 
-		cn, _, err := c.getConn()
+		cn, _, err := c.getConn(ctx)
 		if err != nil {
 			cmd.setErr(err)
 			if internal.IsRetryableError(err, true) {
+				span.Annotatef([]trace.Attribute{
+					trace.StringAttribute("err", err.Error()),
+					trace.Int64Attribute("attempt", int64(attempt)),
+				}, "Retryable error so retrying")
 				continue
 			}
+			span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
 			return err
 		}
 
 		cn.SetWriteTimeout(c.opt.WriteTimeout)
-		if err := writeCmd(cn, cmd); err != nil {
-			c.releaseConn(cn, err)
-			cmd.setErr(err)
-			if internal.IsRetryableError(err, true) {
+		_, wSpan := trace.StartSpan(ctx, "redis.writeCmd")
+		wErr := writeCmd(ctx, cn, cmd)
+		wSpan.End()
+		if wErr != nil {
+			releaseStart := time.Now()
+			span.Annotatef(nil, "Releasing connection")
+			reusedConn := c.releaseConn(ctx, cn, wErr)
+			status := "removed conn"
+			if reusedConn {
+				status = "reused conn"
+			}
+			span.Annotatef([]trace.Attribute{
+				trace.StringAttribute("time_spent", time.Since(releaseStart).String()),
+				trace.StringAttribute("status", status),
+			}, "Released connection")
+			cmd.setErr(wErr)
+			if internal.IsRetryableError(wErr, true) {
 				continue
 			}
+			span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
 			return err
 		}
 
+		_, rSpan := trace.StartSpan(ctx, "redis.(Cmder).readReply")
 		cn.SetReadTimeout(c.cmdTimeout(cmd))
 		err = cmd.readReply(cn)
-		c.releaseConn(cn, err)
-		if err != nil && internal.IsRetryableError(err, cmd.readTimeout() == nil) {
-			continue
+		rSpan.End()
+		span.Annotatef(nil, "Releasing connection")
+		reusedConn := c.releaseConn(ctx, cn, err)
+		status := "removed conn"
+		if reusedConn {
+			status = "reused conn"
+		}
+		span.Annotatef([]trace.Attribute{
+			trace.StringAttribute("status", status),
+		}, "Released connection")
+		// TODO: (@odeke-em) multiplex on the errors retrieved
+		if err != nil {
+			span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
+			if internal.IsRetryableError(err, cmd.readTimeout() == nil) {
+				continue
+			}
 		}
 
 		return err
 	}
 
-	return cmd.Err()
+	eErr := cmd.Err()
+	if eErr != nil {
+		// TODO: (@odeke-em) tally/categorize these errors and increment them
+		span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: eErr.Error()})
+	}
+	return eErr
 }
 
 func (c *baseClient) retryBackoff(attempt int) time.Duration {
@@ -220,13 +307,26 @@ func (c *baseClient) defaultProcessTxPipeline(cmds []Cmder) error {
 type pipelineProcessor func(*pool.Conn, []Cmder) (bool, error)
 
 func (c *baseClient) generalProcessPipeline(cmds []Cmder, p pipelineProcessor) error {
+	ctx, span := trace.StartSpan(c.context(), "redis.(*baseClient).generalProcessPipeline")
+	defer span.End()
+
 	for attempt := 0; attempt <= c.opt.MaxRetries; attempt++ {
+		span.Annotatef([]trace.Attribute{
+			trace.Int64Attribute("attempt", int64(attempt)),
+		}, "Getting connection")
+
 		if attempt > 0 {
-			time.Sleep(c.retryBackoff(attempt))
+			td := c.retryBackoff(attempt)
+			span.Annotatef([]trace.Attribute{
+				trace.StringAttribute("sleep_duration", td.String()),
+				trace.Int64Attribute("attempt", int64(attempt)),
+			}, "Sleeping for exponential backoff")
+			time.Sleep(td)
 		}
 
-		cn, _, err := c.getConn()
+		cn, _, err := c.getConn(ctx)
 		if err != nil {
+			span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
 			setCmdsErr(cmds, err)
 			return err
 		}
@@ -234,28 +334,81 @@ func (c *baseClient) generalProcessPipeline(cmds []Cmder, p pipelineProcessor) e
 		canRetry, err := p(cn, cmds)
 
 		if err == nil || internal.IsRedisError(err) {
+			span.Annotatef(nil, "Putting connection back into the pool")
 			_ = c.connPool.Put(cn)
 			break
 		}
+		span.Annotatef(nil, "Removing connection from the pool")
 		_ = c.connPool.Remove(cn)
 
 		if !canRetry || !internal.IsRetryableError(err, true) {
+			span.Annotatef([]trace.Attribute{
+				trace.StringAttribute("err", err.Error()),
+				trace.Int64Attribute("attempt", int64(attempt)),
+			}, "Not retrying hence exiting")
 			break
 		}
+
+		// Otherwise, retrying with the next attempt.
+		span.Annotatef([]trace.Attribute{
+			trace.StringAttribute("err", err.Error()),
+			trace.Int64Attribute("attempt", int64(attempt)),
+		}, "Retryable error so retrying")
 	}
-	return firstCmdsErr(cmds)
+	eErr := firstCmdsErr(cmds)
+	if eErr != nil {
+		span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: eErr.Error()})
+	}
+	return eErr
+}
+
+func attributeNamesFromCommands(cmds []Cmder) []trace.Attribute {
+	if len(cmds) == 0 {
+		return nil
+	}
+	names := namesFromCommands(cmds)
+	attributes := make([]trace.Attribute, len(names))
+	for i, name := range names {
+		attributes[i] = trace.StringAttribute(fmt.Sprintf("%d", i), name)
+	}
+	return attributes
+}
+
+func namesFromCommands(cmds []Cmder) []string {
+	names := make([]string, len(cmds))
+	for i, cmd := range cmds {
+		names[i] = cmd.Name()
+	}
+	return names
 }
 
 func (c *baseClient) pipelineProcessCmds(cn *pool.Conn, cmds []Cmder) (bool, error) {
+	ctx, span := trace.StartSpan(c.context(), "redis.(*baseClient).pipelineProcessCmds")
+	defer span.End()
+	attributes := append(attributeNamesFromCommands(cmds),
+		trace.StringAttribute("read_timeout", c.opt.ReadTimeout.String()),
+		trace.StringAttribute("write_timeout", c.opt.WriteTimeout.String()),
+	)
+	span.Annotatef(attributes, "With commands")
+
 	cn.SetWriteTimeout(c.opt.WriteTimeout)
-	if err := writeCmd(cn, cmds...); err != nil {
+	_, wSpan := trace.StartSpan(ctx, "redis.writeCmd")
+	defer wSpan.End()
+	if err := writeCmd(ctx, cn, cmds...); err != nil {
+		wSpan.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
 		setCmdsErr(cmds, err)
 		return true, err
 	}
 
 	// Set read timeout for all commands.
 	cn.SetReadTimeout(c.opt.ReadTimeout)
-	return true, pipelineReadCmds(cn, cmds)
+	_, rSpan := trace.StartSpan(ctx, "redis.pipelineReadCmds")
+	err := pipelineReadCmds(cn, cmds)
+	if err != nil {
+		rSpan.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
+	}
+	rSpan.End()
+	return true, err
 }
 
 func pipelineReadCmds(cn *pool.Conn, cmds []Cmder) error {
@@ -270,7 +423,7 @@ func pipelineReadCmds(cn *pool.Conn, cmds []Cmder) error {
 
 func (c *baseClient) txPipelineProcessCmds(cn *pool.Conn, cmds []Cmder) (bool, error) {
 	cn.SetWriteTimeout(c.opt.WriteTimeout)
-	if err := txPipelineWriteMulti(cn, cmds); err != nil {
+	if err := txPipelineWriteMulti(c.context(), cn, cmds); err != nil {
 		setCmdsErr(cmds, err)
 		return true, err
 	}
@@ -286,12 +439,12 @@ func (c *baseClient) txPipelineProcessCmds(cn *pool.Conn, cmds []Cmder) (bool, e
 	return false, pipelineReadCmds(cn, cmds)
 }
 
-func txPipelineWriteMulti(cn *pool.Conn, cmds []Cmder) error {
+func txPipelineWriteMulti(ctx context.Context, cn *pool.Conn, cmds []Cmder) error {
 	multiExec := make([]Cmder, 0, len(cmds)+2)
 	multiExec = append(multiExec, NewStatusCmd("MULTI"))
 	multiExec = append(multiExec, cmds...)
 	multiExec = append(multiExec, NewSliceCmd("EXEC"))
-	return writeCmd(cn, multiExec...)
+	return writeCmd(ctx, cn, multiExec...)
 }
 
 func (c *baseClient) txPipelineReadQueued(cn *pool.Conn, cmds []Cmder) error {
@@ -351,7 +504,9 @@ func NewClient(opt *Options) *Client {
 			opt:      opt,
 			connPool: newConnPool(opt),
 		},
+		ctx: opt.Context,
 	}
+	c.baseClient.ctxFunc = c.Context
 	c.baseClient.init()
 	c.init()
 

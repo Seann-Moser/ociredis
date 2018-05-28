@@ -1,6 +1,7 @@
 package redis
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -100,7 +101,8 @@ func (c *PubSub) _subscribe(cn *pool.Conn, redisCmd string, channels ...string) 
 	cmd := NewSliceCmd(args...)
 
 	cn.SetWriteTimeout(c.opt.WriteTimeout)
-	return writeCmd(cn, cmd)
+	// TODO: (@odeke-em) use the propagated context
+	return writeCmd(context.Background(), cn, cmd)
 }
 
 func (c *PubSub) releaseConn(cn *pool.Conn, err error) {
@@ -217,7 +219,8 @@ func (c *PubSub) Ping(payload ...string) error {
 	}
 
 	cn.SetWriteTimeout(c.opt.WriteTimeout)
-	err = writeCmd(cn, cmd)
+	// TODO: (@odeke-em) use the propagated context
+	err = writeCmd(context.Background(), cn, cmd)
 	c.releaseConn(cn, err)
 	return err
 }

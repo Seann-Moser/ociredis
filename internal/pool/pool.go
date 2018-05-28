@@ -133,6 +133,7 @@ func (p *ConnPool) tryDial() {
 			continue
 		}
 
+		// TODO: Stats: (@odeke-em) Record successful dial
 		atomic.StoreUint32(&p.dialErrorsNum, 0)
 		_ = conn.Close()
 		return
@@ -173,6 +174,7 @@ func (p *ConnPool) Get() (*Conn, bool, error) {
 		case <-timer.C:
 			timers.Put(timer)
 			atomic.AddUint32(&p.stats.Timeouts, 1)
+			// TODO: Stats: (@odeke-em) Record Pool timeouts
 			return nil, false, ErrPoolTimeout
 		}
 	}
@@ -187,10 +189,12 @@ func (p *ConnPool) Get() (*Conn, bool, error) {
 		}
 
 		if cn.IsStale(p.opt.IdleTimeout) {
+			// TODO: Stats: (@odeke-em) Record stale connection
 			p.CloseConn(cn)
 			continue
 		}
 
+		// TODO: Stats: (@odeke-em) Record reused connection
 		atomic.AddUint32(&p.stats.Hits, 1)
 		return cn, false, nil
 	}
@@ -203,6 +207,7 @@ func (p *ConnPool) Get() (*Conn, bool, error) {
 		return nil, false, err
 	}
 
+	// TODO: Stats: (@odeke-em) Record taken connection
 	return newcn, true, nil
 }
 
@@ -226,6 +231,7 @@ func (p *ConnPool) Put(cn *Conn) error {
 	p.freeConns = append(p.freeConns, cn)
 	p.freeConnsMu.Unlock()
 	<-p.queue
+	// TODO: Stats: (@odeke-em) Record Conn Put
 	return nil
 }
 
@@ -252,6 +258,7 @@ func (p *ConnPool) closeConn(cn *Conn) error {
 	if p.opt.OnClose != nil {
 		_ = p.opt.OnClose(cn)
 	}
+	// TODO: Stats: (@odeke-em) Record Conn Close
 	return cn.Close()
 }
 

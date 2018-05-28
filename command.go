@@ -2,15 +2,20 @@ package redis
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-redis/redis/internal"
+	"github.com/go-redis/redis/internal/observability"
 	"github.com/go-redis/redis/internal/pool"
 	"github.com/go-redis/redis/internal/proto"
 	"github.com/go-redis/redis/internal/util"
+
+	"go.opencensus.io/stats"
+	"go.opencensus.io/trace"
 )
 
 type Cmder interface {
@@ -44,15 +49,40 @@ func firstCmdsErr(cmds []Cmder) error {
 	return nil
 }
 
-func writeCmd(cn *pool.Conn, cmds ...Cmder) error {
+func writeCmd(ctx context.Context, cn *pool.Conn, cmds ...Cmder) error {
+	// 1. Start the span: It is imperative that we always start the span first before
+	// recording stats to ensure that the original context contains the parent span.
+	ctx, span := trace.StartSpan(ctx, "redis.writeCmd")
+	// 2. Record stats
+	ctx, _ = observability.TagKeyValuesIntoContext(ctx, observability.KeyCommandName, namesFromCommands(cmds)...)
 	cn.Wb.Reset()
+	stats.Record(ctx, observability.MWrites.M(1))
+	span.Annotatef([]trace.Attribute{
+		trace.Int64Attribute("n_args", int64(len(cmds))),
+	}, "Write buffer argument appending")
+
 	for _, cmd := range cmds {
 		if err := cn.Wb.Append(cmd.Args()); err != nil {
+			span.End()
+			stats.Record(ctx, observability.MWriteErrors.M(1))
 			return err
 		}
 	}
 
-	_, err := cn.Write(cn.Wb.Bytes())
+	out := cn.Wb.Bytes()
+	span.Annotatef([]trace.Attribute{
+		trace.Int64Attribute("len", int64(len(out))),
+	}, "Created bytes")
+	nWrote, err := cn.Write(out)
+	span.Annotatef([]trace.Attribute{
+		trace.Int64Attribute("len", int64(nWrote)),
+	}, "Wrote out bytes")
+	if err != nil {
+		span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
+		stats.Record(ctx, observability.MWriteErrors.M(1))
+	}
+	span.End()
+	stats.Record(ctx, observability.MWrites.M(1), observability.MBytesWritten.M(int64(nWrote)))
 	return err
 }
 

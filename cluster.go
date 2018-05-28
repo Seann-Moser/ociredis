@@ -18,6 +18,8 @@ import (
 	"github.com/go-redis/redis/internal/pool"
 	"github.com/go-redis/redis/internal/proto"
 	"github.com/go-redis/redis/internal/singleflight"
+
+	"go.opencensus.io/trace"
 )
 
 var errClusterNoNodes = fmt.Errorf("redis: cluster has no nodes")
@@ -61,6 +63,9 @@ type ClusterOptions struct {
 	IdleCheckFrequency time.Duration
 
 	TLSConfig *tls.Config
+
+	// The initial context
+	Context context.Context
 }
 
 func (opt *ClusterOptions) init() {
@@ -642,6 +647,7 @@ func NewClusterClient(opt *ClusterOptions) *ClusterClient {
 	c := &ClusterClient{
 		opt:   opt,
 		nodes: newClusterNodes(opt),
+		ctx:   opt.Context,
 	}
 	c.state = newClusterStateHolder(c.loadState)
 	c.cmdsInfoCache = newCmdsInfoCache(c.cmdsInfo)
@@ -864,14 +870,31 @@ func (c *ClusterClient) Process(cmd Cmder) error {
 }
 
 func (c *ClusterClient) defaultProcess(cmd Cmder) error {
+	_, span := trace.StartSpan(c.Context(), "redis.(*ClusterClient)."+cmd.Name())
+	defer span.End()
+	// TODO: (@odeke-em) record stats to tally the number of respective invocations e.g:
+	//      * "LPOP" --> increment the count of LPOP invocations.
+	//      * "HGET" --> increment the count of HGET invocations.
+
 	var node *clusterNode
 	var ask bool
 	for attempt := 0; attempt <= c.opt.MaxRedirects; attempt++ {
+		span.Annotatef([]trace.Attribute{
+			trace.Int64Attribute("attempt", int64(attempt)),
+			trace.Int64Attribute("write_timeout_ns", c.opt.WriteTimeout.Nanoseconds()),
+		}, "Getting connection")
+
 		if attempt > 0 {
-			time.Sleep(c.retryBackoff(attempt))
+			td := c.retryBackoff(attempt)
+			span.Annotatef([]trace.Attribute{
+				trace.Int64Attribute("attempt", int64(attempt)),
+				trace.StringAttribute("sleep_duration", td.String()),
+			}, "Sleeping for exponential backoff")
+			time.Sleep(td)
 		}
 
 		if node == nil {
+			span.Annotatef(nil, "Creating new node")
 			var err error
 			_, node, err = c.cmdSlotAndNode(cmd)
 			if err != nil {
@@ -882,6 +905,7 @@ func (c *ClusterClient) defaultProcess(cmd Cmder) error {
 
 		var err error
 		if ask {
+			span.Annotatef(nil, "Invoking command: ASKING")
 			pipe := node.Client.Pipeline()
 			_ = pipe.Process(NewCmd("ASKING"))
 			_ = pipe.Process(cmd)
@@ -899,11 +923,20 @@ func (c *ClusterClient) defaultProcess(cmd Cmder) error {
 
 		// If slave is loading - read from master.
 		if c.opt.ReadOnly && internal.IsLoadingError(err) {
+			span.Annotatef([]trace.Attribute{
+				trace.Int64Attribute("attempt", int64(attempt)),
+				trace.StringAttribute("err", err.Error()),
+			}, "Node is still loading")
 			node.MarkAsLoading()
 			continue
 		}
 
 		if internal.IsRetryableError(err, true) {
+			span.Annotatef([]trace.Attribute{
+				trace.Int64Attribute("attempt", int64(attempt)),
+				trace.StringAttribute("err", err.Error()),
+			}, "Retryable error so retrying")
+
 			// Firstly retry the same node.
 			if attempt == 0 {
 				continue
@@ -912,8 +945,15 @@ func (c *ClusterClient) defaultProcess(cmd Cmder) error {
 			// Secondly try random node.
 			node, err = c.nodes.Random()
 			if err != nil {
+				span.Annotatef(nil, "Failed to pick a random node")
+				span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
 				break
 			}
+
+			span.Annotatef([]trace.Attribute{
+				trace.Int64Attribute("attempt", int64(attempt)),
+				trace.StringAttribute("err", err.Error()),
+			}, "Retryable error so retrying")
 			continue
 		}
 
@@ -921,10 +961,18 @@ func (c *ClusterClient) defaultProcess(cmd Cmder) error {
 		var addr string
 		moved, ask, addr = internal.IsMovedError(err)
 		if moved || ask {
+			span.Annotatef(nil, "Performing lazy reload")
 			c.state.LazyReload()
+			span.Annotatef(nil, "Finished lazy reload")
 
 			node, err = c.nodes.GetOrCreate(addr)
 			if err != nil {
+				span.Annotatef([]trace.Attribute{
+					trace.StringAttribute("addr", addr),
+					trace.Int64Attribute("attempt", int64(attempt)),
+					trace.StringAttribute("err", err.Error()),
+				}, "Failed to create or get a node")
+				span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: err.Error()})
 				break
 			}
 			continue
@@ -938,7 +986,11 @@ func (c *ClusterClient) defaultProcess(cmd Cmder) error {
 		break
 	}
 
-	return cmd.Err()
+	eErr := cmd.Err()
+	if eErr != nil {
+		span.SetStatus(trace.Status{Code: int32(trace.StatusCodeInternal), Message: eErr.Error()})
+	}
+	return eErr
 }
 
 // ForEachMaster concurrently calls the fn on each master node in the cluster.
@@ -1172,7 +1224,7 @@ func (c *ClusterClient) defaultProcessPipeline(cmds []Cmder) error {
 		failedCmds := make(map[*clusterNode][]Cmder)
 
 		for node, cmds := range cmdsMap {
-			cn, _, err := node.Client.getConn()
+			cn, _, err := node.Client.getConn(c.Context())
 			if err != nil {
 				if err == pool.ErrClosed {
 					c.remapCmds(cmds, failedCmds)
@@ -1235,7 +1287,7 @@ func (c *ClusterClient) pipelineProcessCmds(
 ) error {
 	_ = cn.SetWriteTimeout(c.opt.WriteTimeout)
 
-	err := writeCmd(cn, cmds...)
+	err := writeCmd(c.Context(), cn, cmds...)
 	if err != nil {
 		setCmdsErr(cmds, err)
 		failedCmds[node] = cmds
@@ -1336,7 +1388,7 @@ func (c *ClusterClient) defaultProcessTxPipeline(cmds []Cmder) error {
 			failedCmds := make(map[*clusterNode][]Cmder)
 
 			for node, cmds := range cmdsMap {
-				cn, _, err := node.Client.getConn()
+				cn, _, err := node.Client.getConn(c.Context())
 				if err != nil {
 					if err == pool.ErrClosed {
 						c.remapCmds(cmds, failedCmds)
@@ -1377,7 +1429,7 @@ func (c *ClusterClient) txPipelineProcessCmds(
 	node *clusterNode, cn *pool.Conn, cmds []Cmder, failedCmds map[*clusterNode][]Cmder,
 ) error {
 	cn.SetWriteTimeout(c.opt.WriteTimeout)
-	if err := txPipelineWriteMulti(cn, cmds); err != nil {
+	if err := txPipelineWriteMulti(c.Context(), cn, cmds); err != nil {
 		setCmdsErr(cmds, err)
 		failedCmds[node] = cmds
 		return err
