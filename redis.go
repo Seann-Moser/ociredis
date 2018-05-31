@@ -168,7 +168,7 @@ func (c *baseClient) defaultProcess(cmd Cmder) error {
 	defer func() {
 		span.End()
 		// Finally record the roundtrip latency.
-		stats.Record(ctx, observability.MRoundtripLatency.M(time.Since(startTime).Seconds()))
+		stats.Record(ctx, observability.MRoundtripLatencyMilliseconds.M(time.Since(startTime).Seconds()*1000))
 	}()
 
 	for attempt := 0; attempt <= c.opt.MaxRetries; attempt++ {
