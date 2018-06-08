@@ -27,6 +27,7 @@ func BenchmarkRedisPing(b *testing.B) {
 	defer client.Close()
 
 	b.ResetTimer()
+	b.ReportAllocs()
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
@@ -44,6 +45,7 @@ func BenchmarkRedisSetString(b *testing.B) {
 	value := string(bytes.Repeat([]byte{'1'}, 10000))
 
 	b.ResetTimer()
+	b.ReportAllocs()
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
@@ -59,6 +61,7 @@ func BenchmarkRedisGetNil(b *testing.B) {
 	defer client.Close()
 
 	b.ResetTimer()
+	b.ReportAllocs()
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
@@ -76,6 +79,7 @@ func benchmarkSetRedis(b *testing.B, poolSize, payloadSize int) {
 	value := string(bytes.Repeat([]byte{'1'}, payloadSize))
 
 	b.ResetTimer()
+	b.ReportAllocs()
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
@@ -152,6 +156,7 @@ func BenchmarkRedisMGet(b *testing.B) {
 	}
 
 	b.ResetTimer()
+	b.ReportAllocs()
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
@@ -167,6 +172,7 @@ func BenchmarkSetExpire(b *testing.B) {
 	defer client.Close()
 
 	b.ResetTimer()
+	b.ReportAllocs()
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
@@ -185,6 +191,7 @@ func BenchmarkPipeline(b *testing.B) {
 	defer client.Close()
 
 	b.ResetTimer()
+	b.ReportAllocs()
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
@@ -205,6 +212,7 @@ func BenchmarkZAdd(b *testing.B) {
 	defer client.Close()
 
 	b.ResetTimer()
+	b.ReportAllocs()
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
