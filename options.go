@@ -1,6 +1,7 @@
 package redis
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -77,6 +78,9 @@ type Options struct {
 
 	// TLS Config to use. When set TLS will be negotiated.
 	TLSConfig *tls.Config
+
+	// The initial context
+	Context context.Context
 }
 
 func (opt *Options) init() {

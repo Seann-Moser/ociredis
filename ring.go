@@ -525,7 +525,7 @@ func (c *Ring) defaultProcessPipeline(cmds []Cmder) error {
 				continue
 			}
 
-			cn, _, err := shard.Client.getConn()
+			cn, _, err := shard.Client.getConn(c.Context())
 			if err != nil {
 				setCmdsErr(cmds, err)
 				continue

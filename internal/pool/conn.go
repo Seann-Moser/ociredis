@@ -66,6 +66,7 @@ func (cn *Conn) SetWriteTimeout(timeout time.Duration) error {
 }
 
 func (cn *Conn) Write(b []byte) (int, error) {
+	// TODO: Stats: (@odeke-em) Record written bytes
 	return cn.netConn.Write(b)
 }
 
@@ -74,5 +75,6 @@ func (cn *Conn) RemoteAddr() net.Addr {
 }
 
 func (cn *Conn) Close() error {
+	// TODO: Stats: (@odeke-em) Record Conn closes
 	return cn.netConn.Close()
 }
