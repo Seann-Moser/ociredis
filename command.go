@@ -8,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-redis/redis/internal"
-	"github.com/go-redis/redis/internal/observability"
-	"github.com/go-redis/redis/internal/pool"
-	"github.com/go-redis/redis/internal/proto"
-	"github.com/go-redis/redis/internal/util"
+	"github.com/Seann-Moser/ociredis/internal"
+	"github.com/Seann-Moser/ociredis/internal/observability"
+	"github.com/Seann-Moser/ociredis/internal/pool"
+	"github.com/Seann-Moser/ociredis/internal/proto"
+	"github.com/Seann-Moser/ociredis/internal/util"
 
 	"go.opencensus.io/stats"
 	"go.opencensus.io/trace"

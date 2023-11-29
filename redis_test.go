@@ -5,10 +5,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/go-redis/redis"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/Seann-Moser/ociredis"
 )
 
 var _ = Describe("Client", func() {

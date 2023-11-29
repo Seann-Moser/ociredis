@@ -4,10 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-redis/redis/internal/pool"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/Seann-Moser/ociredis/internal/pool"
 )
 
 var _ = Describe("ConnPool", func() {

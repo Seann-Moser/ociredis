@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-redis/redis/internal/pool"
+	"github.com/Seann-Moser/ociredis/internal/pool"
 )
 
 type Options struct {

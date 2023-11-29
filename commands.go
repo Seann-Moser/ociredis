@@ -5,7 +5,7 @@ import (
 	"io"
 	"time"
 
-	"github.com/go-redis/redis/internal"
+	"github.com/Seann-Moser/ociredis/internal"
 )
 
 func readTimeout(timeout time.Duration) time.Duration {

@@ -13,11 +13,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/go-redis/redis/internal"
-	"github.com/go-redis/redis/internal/hashtag"
-	"github.com/go-redis/redis/internal/pool"
-	"github.com/go-redis/redis/internal/proto"
-	"github.com/go-redis/redis/internal/singleflight"
+	"github.com/Seann-Moser/ociredis/internal"
+	"github.com/Seann-Moser/ociredis/internal/hashtag"
+	"github.com/Seann-Moser/ociredis/internal/pool"
+	"github.com/Seann-Moser/ociredis/internal/proto"
+	"github.com/Seann-Moser/ociredis/internal/singleflight"
 
 	"go.opencensus.io/trace"
 )

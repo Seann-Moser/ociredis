@@ -10,11 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-redis/redis"
-	"github.com/go-redis/redis/internal/hashtag"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/Seann-Moser/ociredis"
+	"github.com/Seann-Moser/ociredis/internal/hashtag"
 )
 
 type clusterScenario struct {

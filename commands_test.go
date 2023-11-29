@@ -6,11 +6,8 @@ import (
 	"reflect"
 	"time"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-
-	"github.com/go-redis/redis"
-	"github.com/go-redis/redis/internal/proto"
+	"github.com/Seann-Moser/ociredis"
+	"github.com/Seann-Moser/ociredis/internal/proto"
 )
 
 var _ = Describe("Commands", func() {
